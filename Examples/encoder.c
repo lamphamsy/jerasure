@@ -44,14 +44,14 @@
    Revision 1.0 - 2007: James S. Plank.
  */
 
-/* 
+/*
 
-This program takes as input an inputfile, k, m, a coding 
-technique, w, and packetsize.  It creates k+m files from 
-the original file so that k of these files are parts of 
-the original file and m of the files are encoded based on 
-the given coding technique. The format of the created files 
-is the file name with "_k#" or "_m#" and then the extension.  
+This program takes as input an inputfile, k, m, a coding
+technique, w, and packetsize.  It creates k+m files from
+the original file so that k of these files are parts of
+the original file and m of the files are encoded based on
+the given coding technique. The format of the created files
+is the file name with "_k#" or "_m#" and then the extension.
 (For example, inputfile test.txt would yield file "test_k1.txt".)
 */
 
@@ -71,13 +71,18 @@ is the file name with "_k#" or "_m#" and then the extension.
 #include "reed_sol.h"
 #include "cauchy.h"
 #include "liberation.h"
+#include "ec.h"
 #include "timing.h"
 
-#define N 10
+#define N 11
 
-enum Coding_Technique {Reed_Sol_Van, Reed_Sol_R6_Op, Cauchy_Orig, Cauchy_Good, Liberation, Blaum_Roth, Liber8tion, RDP, EVENODD, No_Coding};
+enum Coding_Technique {Reed_Sol_Van, Reed_Sol_R6_Op, Cauchy_Orig, Cauchy_Good, Liberation, Blaum_Roth, Liber8tion, RDP, EVENODD, Ec_Pcm, No_Coding};
 
-char *Methods[N] = {"reed_sol_van", "reed_sol_r6_op", "cauchy_orig", "cauchy_good", "liberation", "blaum_roth", "liber8tion", "no_coding"};
+enum Ec_Method {EC_Vandermonde, EC_Cauchy};
+
+char *Methods[N] = {"reed_sol_van", "reed_sol_r6_op", "cauchy_orig", "cauchy_good", "liberation", "blaum_roth", "liber8tion", "ec_pcm", "no_coding"};
+
+char *EcMethod[N] = {"vandermonde", "cauchy"};
 
 /* Global variables for signal handler */
 int readins, n;
@@ -95,14 +100,26 @@ int jfread(void *ptr, int size, int nmembers, FILE *stream)
   return size;
 }
 
+void show(int *mat, int m, int k) {
+    int i, j;
+    // show pcm
+    for (i = 0; i < m; i++) {
+        for (j = 0; j < k; j++) {
+            printf("%2d ", mat[i*k + j]);
+        }
+        printf("\n");
+    }
+}
 
 int main (int argc, char **argv) {
 	FILE *fp, *fp2;				// file pointers
 	char *block;				// padding file
-	int size, newsize;			// size of file and temp size 
+	int size, newsize;			// size of file and temp size
 	struct stat status;			// finding file size
 
-	
+    int run_nb = 1;             // number of runs
+    enum Ec_Method ec_method;	// method for ec_pcm
+
 	enum Coding_Technique tech;		// coding technique (parameter)
 	int k, m, w, packetsize;		// parameters
 	int buffersize;					// paramter
@@ -110,26 +127,29 @@ int main (int argc, char **argv) {
 	int blocksize;					// size of k+m files
 	int total;
 	int extra;
-	
+
 	/* Jerasure Arguments */
-	char **data;				
+	char **data;
 	char **coding;
 	int *matrix;
 	int *bitmatrix;
 	int **schedule;
-	
+
 	/* Creation of file name variables */
 	char temp[5];
 	char *s1, *s2, *extension;
 	char *fname;
 	int md;
 	char *curdir;
-	
+
 	/* Timing variables */
 	struct timing t1, t2, t3, t4;
 	double tsec;
 	double totalsec;
 	struct timing start;
+
+    /* Throughput */
+    double enc_speed;
 
 	/* Find buffersize */
 	int up, down;
@@ -143,17 +163,17 @@ int main (int argc, char **argv) {
 	matrix = NULL;
 	bitmatrix = NULL;
 	schedule = NULL;
-	
+
 	/* Error check Arguments*/
-	if (argc != 8) {
-		fprintf(stderr,  "usage: inputfile k m coding_technique w packetsize buffersize\n");
-		fprintf(stderr,  "\nChoose one of the following coding techniques: \nreed_sol_van, \nreed_sol_r6_op, \ncauchy_orig, \ncauchy_good, \nliberation, \nblaum_roth, \nliber8tion");
+	if (argc != 8 && argc != 9 && argc != 10) {
+		fprintf(stderr,  "usage: inputfile k m coding_technique w packetsize buffersize [run_nb] [ec_method]\n");
+		fprintf(stderr,  "\nChoose one of the following coding techniques: \nreed_sol_van, \nreed_sol_r6_op, \ncauchy_orig, \ncauchy_good, \nliberation, \nblaum_roth, \nliber8tion, \nec_pcm");
 		fprintf(stderr,  "\n\nPacketsize is ignored for the reed_sol's");
 		fprintf(stderr,  "\nBuffersize of 0 means the buffersize is chosen automatically.\n");
 		fprintf(stderr,  "\nIf you just want to test speed, use an inputfile of \"-number\" where number is the size of the fake file you want to test.\n\n");
 		exit(0);
 	}
-	/* Conversion of parameters and error checking */	
+	/* Conversion of parameters and error checking */
 	if (sscanf(argv[2], "%d", &k) == 0 || k <= 0) {
 		fprintf(stderr,  "Invalid value for k\n");
 		exit(0);
@@ -183,12 +203,19 @@ int main (int argc, char **argv) {
 			fprintf(stderr, "Invalid value for buffersize\n");
 			exit(0);
 		}
-		
+
 	}
+    if (argc >= 9) {
+        if (sscanf(argv[8],"%d", &run_nb) == 0 || run_nb <= 0) {
+    		fprintf(stderr,  "Invalid value for run_nb.\n");
+    		exit(0);
+    	}
+	}
+
 
 	/* Determine proper buffersize by finding the closest valid buffersize to the input value  */
 	if (buffersize != 0) {
-		if (packetsize != 0 && buffersize%(sizeof(long)*w*k*packetsize) != 0) { 
+		if (packetsize != 0 && buffersize%(sizeof(long)*w*k*packetsize) != 0) {
 			up = buffersize;
 			down = buffersize;
 			while (up%(sizeof(long)*w*k*packetsize) != 0 && (down%(sizeof(long)*w*k*packetsize) != 0)) {
@@ -223,11 +250,30 @@ int main (int argc, char **argv) {
 	}
 
 	/* Setting of coding technique and error checking */
-	
+
 	if (strcmp(argv[4], "no_coding") == 0) {
 		tech = No_Coding;
 	}
-	else if (strcmp(argv[4], "reed_sol_van") == 0) {
+    else if (strcmp(argv[4], "ec_pcm") == 0) {
+        tech = Ec_Pcm;
+        ec_method = EC_Vandermonde;
+        if (argc == 10) {
+            if (strcmp(argv[9], "cauchy") == 0) {
+                ec_method = EC_Cauchy;
+                if (packetsize == 0) {
+        			fprintf(stderr, "Must include packetsize.\n");
+        			exit(0);
+        		}
+            }
+        }
+        if (ec_method == EC_Vandermonde) {
+            if (w != 8 && w != 16 && w != 32) {
+                fprintf(stderr,  "w must be one of {8, 16, 32}\n");
+                exit(0);
+            }
+        }
+    }
+    else if (strcmp(argv[4], "reed_sol_van") == 0) {
 		tech = Reed_Sol_Van;
 		if (w != 8 && w != 16 && w != 32) {
 			fprintf(stderr,  "w must be one of {8, 16, 32}\n");
@@ -317,7 +363,7 @@ int main (int argc, char **argv) {
 		tech = Liber8tion;
 	}
 	else {
-		fprintf(stderr,  "Not a valid coding technique. Choose one of the following: reed_sol_van, reed_sol_r6_op, cauchy_orig, cauchy_good, liberation, blaum_roth, liber8tion, no_coding\n");
+		fprintf(stderr,  "Not a valid coding technique. Choose one of the following: reed_sol_van, reed_sol_r6_op, cauchy_orig, cauchy_good, liberation, blaum_roth, liber8tion, ec_pcm, no_coding\n");
 		exit(0);
 	}
 
@@ -325,7 +371,7 @@ int main (int argc, char **argv) {
 	method = tech;
 
 	/* Get current working directory for construction of file names */
-	curdir = (char*)malloc(sizeof(char)*1000);	
+	curdir = (char*)malloc(sizeof(char)*1000);
 	assert(curdir == getcwd(curdir, 1000));
 
         if (argv[1][0] != '-') {
@@ -336,16 +382,16 @@ int main (int argc, char **argv) {
 			fprintf(stderr,  "Unable to open file.\n");
 			exit(0);
 		}
-	
+
 		/* Create Coding directory */
 		i = mkdir("Coding", S_IRWXU);
 		if (i == -1 && errno != EEXIST) {
 			fprintf(stderr, "Unable to create Coding directory.\n");
 			exit(0);
 		}
-	
+
 		/* Determine original size of file */
-		stat(argv[1], &status);	
+		stat(argv[1], &status);
 		size = status.st_size;
         } else {
         	if (sscanf(argv[1]+1, "%d", &size) != 1 || size <= 0) {
@@ -357,21 +403,21 @@ int main (int argc, char **argv) {
         }
 
 	newsize = size;
-	
+
 	/* Find new size by determining next closest multiple */
 	if (packetsize != 0) {
 		if (size%(k*w*packetsize*sizeof(long)) != 0) {
-			while (newsize%(k*w*packetsize*sizeof(long)) != 0) 
+			while (newsize%(k*w*packetsize*sizeof(long)) != 0)
 				newsize++;
 		}
 	}
 	else {
 		if (size%(k*w*sizeof(long)) != 0) {
-			while (newsize%(k*w*sizeof(long)) != 0) 
+			while (newsize%(k*w*sizeof(long)) != 0)
 				newsize++;
 		}
 	}
-	
+
 	if (buffersize != 0) {
 		while (newsize%buffersize != 0) {
 			newsize++;
@@ -398,8 +444,8 @@ int main (int argc, char **argv) {
 		buffersize = size;
 		block = (char *)malloc(sizeof(char)*newsize);
 	}
-	
-	/* Break inputfile name into the filename and extension */	
+
+	/* Break inputfile name into the filename and extension */
 	s1 = (char*)malloc(sizeof(char)*(strlen(argv[1])+20));
 	s2 = strrchr(argv[1], '/');
 	if (s2 != NULL) {
@@ -416,12 +462,12 @@ int main (int argc, char **argv) {
 	} else {
           extension = strdup("");
         }
-	
+
 	/* Allocate for full file name */
 	fname = (char*)malloc(sizeof(char)*(strlen(argv[1])+strlen(curdir)+20));
 	sprintf(temp, "%d", k);
 	md = strlen(temp);
-	
+
 	/* Allocate data and coding */
 	data = (char **)malloc(sizeof(char*)*k);
 	coding = (char **)malloc(sizeof(char*)*m);
@@ -430,12 +476,20 @@ int main (int argc, char **argv) {
                 if (coding[i] == NULL) { perror("malloc"); exit(1); }
 	}
 
-	
+
 
 	/* Create coding matrix or bitmatrix and schedule */
 	timing_set(&t3);
 	switch(tech) {
 		case No_Coding:
+			break;
+        case Ec_Pcm:
+            // as EC_Cauchy
+    		matrix = ec_pcm(k, m, w);
+            if (ec_method == EC_Cauchy) {
+                bitmatrix = jerasure_matrix_to_bitmatrix(k, m, w, matrix);
+    			schedule = jerasure_smart_bitmatrix_to_schedule(k, m, w, bitmatrix);
+            }
 			break;
 		case Reed_Sol_Van:
 			matrix = reed_sol_vandermonde_coding_matrix(k, m, w);
@@ -451,7 +505,7 @@ int main (int argc, char **argv) {
 			matrix = cauchy_good_general_coding_matrix(k, m, w);
 			bitmatrix = jerasure_matrix_to_bitmatrix(k, m, w, matrix);
 			schedule = jerasure_smart_bitmatrix_to_schedule(k, m, w, bitmatrix);
-			break;	
+			break;
 		case Liberation:
 			bitmatrix = liberation_coding_bitmatrix(k, w);
 			schedule = jerasure_smart_bitmatrix_to_schedule(k, m, w, bitmatrix);
@@ -470,16 +524,15 @@ int main (int argc, char **argv) {
 	}
 	timing_set(&start);
 	timing_set(&t4);
-	totalsec += timing_delta(&t3, &t4);
-
-	
+    // Don't take constructing time
+	// totalsec += timing_delta(&t3, &t4);
 
 	/* Read in data until finished */
 	n = 1;
 	total = 0;
 
 	while (n <= readins) {
-		/* Check if padding is needed, if so, add appropriate 
+		/* Check if padding is needed, if so, add appropriate
 		   number of zeros */
 		if (total < size && total+buffersize <= size) {
 			total += jfread(block, sizeof(char), buffersize, fp);
@@ -495,44 +548,57 @@ int main (int argc, char **argv) {
 				block[i] = '0';
 			}
 		}
-	
+
 		/* Set pointers to point to file data */
 		for (i = 0; i < k; i++) {
 			data[i] = block+(i*blocksize);
 		}
 
-		timing_set(&t3);
-		/* Encode according to coding method */
-		switch(tech) {	
-			case No_Coding:
-				break;
-			case Reed_Sol_Van:
-				jerasure_matrix_encode(k, m, w, matrix, data, coding, blocksize);
-				break;
-			case Reed_Sol_R6_Op:
-				reed_sol_r6_encode(k, w, data, coding, blocksize);
-				break;
-			case Cauchy_Orig:
-				jerasure_schedule_encode(k, m, w, schedule, data, coding, blocksize, packetsize);
-				break;
-			case Cauchy_Good:
-				jerasure_schedule_encode(k, m, w, schedule, data, coding, blocksize, packetsize);
-				break;
-			case Liberation:
-				jerasure_schedule_encode(k, m, w, schedule, data, coding, blocksize, packetsize);
-				break;
-			case Blaum_Roth:
-				jerasure_schedule_encode(k, m, w, schedule, data, coding, blocksize, packetsize);
-				break;
-			case Liber8tion:
-				jerasure_schedule_encode(k, m, w, schedule, data, coding, blocksize, packetsize);
-				break;
-			case RDP:
-			case EVENODD:
-				assert(0);
-		}
-		timing_set(&t4);
-	
+        timing_set(&t3);
+        for (i = 0; i < run_nb; i++) {
+            /* Encode according to coding method */
+            switch(tech) {
+                case No_Coding:
+                    break;
+                case Ec_Pcm:
+                    if (ec_method == EC_Vandermonde) {
+                        jerasure_matrix_encode(k, m, w, matrix, data, coding,
+                            blocksize);
+                    } else {
+                        jerasure_schedule_encode(k, m, w, schedule, data,
+                            coding, blocksize, packetsize);
+                    }
+                    break;
+                case Reed_Sol_Van:
+                    jerasure_matrix_encode(k, m, w, matrix, data, coding, blocksize);
+                    break;
+                case Reed_Sol_R6_Op:
+                    reed_sol_r6_encode(k, w, data, coding, blocksize);
+                    break;
+                case Cauchy_Orig:
+                    jerasure_schedule_encode(k, m, w, schedule, data, coding, blocksize, packetsize);
+                    break;
+                case Cauchy_Good:
+                    jerasure_schedule_encode(k, m, w, schedule, data, coding, blocksize, packetsize);
+                    break;
+                case Liberation:
+                    jerasure_schedule_encode(k, m, w, schedule, data, coding, blocksize, packetsize);
+                    break;
+                case Blaum_Roth:
+                    jerasure_schedule_encode(k, m, w, schedule, data, coding, blocksize, packetsize);
+                    break;
+                case Liber8tion:
+                    jerasure_schedule_encode(k, m, w, schedule, data, coding, blocksize, packetsize);
+                    break;
+                case RDP:
+                case EVENODD:
+                    assert(0);
+            }
+        }
+        timing_set(&t4);
+        /* Calculate encoding time */
+        totalsec += timing_delta(&t3, &t4);
+
 		/* Write data and encoded data to k+m files */
 		for	(i = 1; i <= k; i++) {
 			if (fp == NULL) {
@@ -548,7 +614,7 @@ int main (int argc, char **argv) {
 				fwrite(data[i-1], sizeof(char), blocksize, fp2);
 				fclose(fp2);
 			}
-			
+
 		}
 		for	(i = 1; i <= m; i++) {
 			if (fp == NULL) {
@@ -566,8 +632,6 @@ int main (int argc, char **argv) {
 			}
 		}
 		n++;
-		/* Calculate encoding time */
-		totalsec += timing_delta(&t3, &t4);
 	}
 
 	/* Create metadata file */
@@ -589,14 +653,17 @@ int main (int argc, char **argv) {
 	free(fname);
 	free(block);
 	free(curdir);
-	
+
 	/* Calculate rate in MB/sec and print */
 	timing_set(&t2);
 	tsec = timing_delta(&t1, &t2);
-	printf("Encoding (MB/sec): %0.10f\n", (((double) size)/1024.0/1024.0)/totalsec);
-	printf("En_Total (MB/sec): %0.10f\n", (((double) size)/1024.0/1024.0)/tsec);
+    enc_speed = (((double) size)/1024.0/1024.0)/totalsec;
+    enc_speed *= (double) run_nb;
+	printf("Encoding (MB/sec): %0.3f\n", enc_speed);
+	// printf("En_Total (MB/sec): %0.10f\n", (((double) size)/1024.0/1024.0)/tsec);
 
-	return 0;
+	// return (int)enc_speed;
+    return 0;
 }
 
 /* is_prime returns 1 if number if prime, 0 if not prime */
@@ -622,6 +689,6 @@ void ctrl_bs_handler(int dummy) {
 	fprintf(stderr, "You just typed ctrl-\\ in encoder.c.\n");
 	fprintf(stderr, "Total number of read ins = %d\n", readins);
 	fprintf(stderr, "Current read in: %d\n", n);
-	fprintf(stderr, "Method: %s\n\n", Methods[method]);	
+	fprintf(stderr, "Method: %s\n\n", Methods[method]);
 	signal(SIGQUIT, ctrl_bs_handler);
 }
